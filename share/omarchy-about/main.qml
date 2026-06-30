@@ -66,10 +66,13 @@ Window {
     // auto-fits its content without a minimumHeight<->height binding loop.
     readonly property int winHeight: Math.round(col.implicitHeight + 2 * margin)
 
+    // Preferred size fits the content (used when floating / on first map), but
+    // the window stays resizable with only a small minimum so it tiles cleanly
+    // under Hyprland instead of fighting the mosaic with a fixed size.
     width: 600
-    minimumWidth: 600;  maximumWidth: 600
+    minimumWidth: 360
     height: winHeight
-    minimumHeight: winHeight; maximumHeight: winHeight
+    minimumHeight: 320
     visible: true
     color: cBg
     title: t("title") + " · Omarchy"
@@ -123,6 +126,17 @@ Window {
         anchors.fill: parent
 
         Rectangle { anchors.fill: parent; color: cBg }
+
+        // Scrollable so the card shows fully at any tile size: when the window
+        // is shorter than the content (small mosaic slot) it scrolls instead of
+        // clipping; when it's tall enough nothing scrolls.
+        Flickable {
+            id: flick
+            anchors.fill: parent
+            contentWidth: width
+            contentHeight: col.implicitHeight + 2 * margin
+            boundsBehavior: Flickable.StopAtBounds
+            clip: true
 
         ColumnLayout {
             id: col
@@ -292,6 +306,7 @@ Window {
                     }
                 }
             }
+        }
         }
     }
 

@@ -8,3 +8,6 @@ src/
 *.swp
 *~
 .DS_Store
+
+# personal/local dev notes (never published)
+*.local.md

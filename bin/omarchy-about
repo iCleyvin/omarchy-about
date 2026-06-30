@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+#
+# omarchy-about — a Windows-style "About this PC" panel for Omarchy.
+#
+# Collects OS / hardware info plus the active Omarchy theme colours, writes
+# them to a temporary JSON file, and renders everything with a Qt6/QML card
+# that auto-adapts to whatever Omarchy theme is currently active.
+#
+# Usage:  omarchy-about [--shot=PATH]
+#   --shot=PATH   render the window to PATH (png) and exit (used for docs/CI)
+#
+set -euo pipefail
+
+APP_NAME="omarchy-about"
+
+# ---------------------------------------------------------------------------
+# Locate the QML assets. Works whether we were installed system-wide (/usr),
+# per-user (~/.local) or are being run straight from a git checkout.
+# ---------------------------------------------------------------------------
+find_share() {
+  local src dir self
+  src="${BASH_SOURCE[0]}"
+  while [ -h "$src" ]; do src="$(readlink "$src")"; done
+  self="$(cd "$(dirname "$src")" && pwd)"
+  for dir in \
+    "$self/../share/$APP_NAME" \
+    "/usr/share/$APP_NAME" \
+    "/usr/local/share/$APP_NAME" \
+    "$HOME/.local/share/$APP_NAME"; do
+    if [ -f "$dir/main.qml" ]; then printf '%s' "$dir"; return 0; fi
+  done
+  return 1
+}
+
+SHARE_DIR="$(find_share)" || {
+  echo "$APP_NAME: could not locate main.qml (is the app installed?)" >&2
+  exit 1
+}
+
+# Pick a QML runtime (qml6 on most distros, qml as fallback).
+QML_BIN="$(command -v qml6 || command -v qml || true)"
+[ -n "$QML_BIN" ] || { echo "$APP_NAME: qml runtime not found (install qt6-declarative)" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Small helpers. Everything is parsed under LC_ALL=C so labels stay English
+# regardless of the user's locale (lscpu/df/uptime are localized otherwise).
+# ---------------------------------------------------------------------------
+# UI language is auto-detected from the user's locale *before* we force C, so
+# that parsing stays English while the interface follows the system language.
+case "${LC_ALL:-${LC_MESSAGES:-${LANG:-en}}}" in
+  es*|ES*) UI_LANG="es" ;;
+  *)       UI_LANG="en" ;;
+esac
+export LC_ALL=C
+have() { command -v "$1" >/dev/null 2>&1; }
+trim() { local s="$*"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+# minimal JSON string escaper (handles the only chars we can realistically hit)
+jesc() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\t'/ }"; s="${s//$'\n'/ }"; printf '%s' "$s"; }
+
+# ---------------------------------------------------------------------------
+# Operating system / host
+# ---------------------------------------------------------------------------
+OS_NAME="Linux"; OS_ID=""
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_NAME="${PRETTY_NAME:-${NAME:-Linux}}"
+  OS_ID="${ID:-}"
+fi
+KERNEL="$(uname -r)"
+ARCH="$(uname -m)"
+HOSTNAME="$(uname -n)"
+# raw uptime in seconds; the QML side formats + localizes it
+UPTIME_SEC="$(awk '{print int($1)}' /proc/uptime 2>/dev/null)"; [ -n "$UPTIME_SEC" ] || UPTIME_SEC=0
+
+# Desktop brand + window manager
+if [ -d "$HOME/.config/omarchy" ]; then BRAND="Omarchy"; else BRAND="${XDG_CURRENT_DESKTOP:-Linux}"; fi
+WM="${XDG_CURRENT_DESKTOP:-}"
+if have hyprctl && hyprctl version >/dev/null 2>&1; then WM="Hyprland"; fi
+[ -n "$WM" ] || WM="—"
+
+# Machine vendor / model (DMI)
+dmi() { cat "/sys/devices/virtual/dmi/id/$1" 2>/dev/null || true; }
+VENDOR="$(trim "$(dmi sys_vendor)")"
+PRODUCT="$(trim "$(dmi product_family)")"
+[ -n "$PRODUCT" ] && [ "$PRODUCT" != "Default string" ] || PRODUCT="$(trim "$(dmi product_name)")"
+MODEL="$(trim "$VENDOR $PRODUCT")"
+[ -n "$(trim "$MODEL")" ] || MODEL="—"
+
+# ---------------------------------------------------------------------------
+# CPU
+# ---------------------------------------------------------------------------
+CPU_MODEL="$(lscpu | awk -F: '/^Model name/{sub(/^[ \t]+/,"",$2); print $2; exit}')"
+[ -n "$CPU_MODEL" ] || CPU_MODEL="$(awk -F: '/^model name/{sub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo)"
+CPU_MODEL="$(echo "$CPU_MODEL" | sed -E 's/ [0-9]+-Core Processor//; s/ Processor$//; s/ w\/.*$//; s/\(R\)|\(TM\)//g')"
+CPU_MODEL="$(trim "$CPU_MODEL")"; [ -n "$CPU_MODEL" ] || CPU_MODEL="—"
+THREADS="$(nproc 2>/dev/null || echo '?')"
+CORES="$(lscpu | awk -F: '/^Core\(s\) per socket/{c=$2} /^Socket\(s\)/{s=$2} END{gsub(/ /,"",c); gsub(/ /,"",s); if(c&&s) print c*s}')"
+[ -n "$CORES" ] || CORES="$THREADS"
+CPU_FREQ="$(lscpu | awk -F: '/^CPU max MHz/{printf "%.2f GHz", $2/1000; exit}')"
+
+# ---------------------------------------------------------------------------
+# GPU(s) — prefer nvidia-smi for the discrete name + VRAM, lspci for the rest
+# ---------------------------------------------------------------------------
+NV_NAME=""; NV_VRAM=""
+if have nvidia-smi; then
+  NV_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+  NV_MIB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)"
+  if [ -n "$NV_MIB" ]; then NV_VRAM="$(awk -v m="$NV_MIB" 'BEGIN{printf "%g GB", (m/1024)+0.0001}' | sed 's/\.[0-9]* / /')"; fi
+fi
+
+GPU_JSON="["
+gpu_first=1
+add_gpu() { # name, vram
+  local n; n="$(jesc "$1")"; local v; v="$(jesc "$2")"
+  [ $gpu_first -eq 1 ] || GPU_JSON+=","
+  GPU_JSON+="{\"name\":\"$n\",\"vram\":\"$v\"}"
+  gpu_first=0
+}
+if have lspci; then
+  while IFS= read -r dev; do
+    [ -n "$dev" ] || continue
+    # extract the friendly "[Product Name]" if present, else the raw device id
+    name="$dev"
+    if [[ "$dev" == *"["*"]"* ]]; then name="${dev#*[}"; name="${name%%]*}"; fi
+    name="$(trim "$name")"
+    vram=""
+    if echo "$dev" | grep -qi nvidia; then
+      [ -n "$NV_NAME" ] && name="$NV_NAME"
+      vram="$NV_VRAM"
+    fi
+    add_gpu "$name" "$vram"
+  done < <(lspci -mm 2>/dev/null | awk -F'"' '/"(VGA compatible controller|3D controller|Display controller)"/{print $6}')
+fi
+[ $gpu_first -eq 0 ] || { [ -n "$NV_NAME" ] && add_gpu "$NV_NAME" "$NV_VRAM"; }
+GPU_JSON+="]"
+
+# ---------------------------------------------------------------------------
+# Memory / storage / display
+# ---------------------------------------------------------------------------
+MEM_KIB="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+MEM_TOTAL="$(awk -v k="$MEM_KIB" 'BEGIN{printf "%.0f GiB", k/1048576}')"
+MEM_USED="$(free -b | awk '/^Mem:/{printf "%.1f GiB", $3/1073741824}')"
+
+read -r DISK_SIZE DISK_USED DISK_AVAIL < <(df -h --output=size,used,avail / 2>/dev/null | tail -1)
+DISK_TOTAL="$(trim "${DISK_SIZE:-}")"; DISK_FREE="$(trim "${DISK_AVAIL:-}")"
+
+DISPLAY_STR=""
+if have hyprctl; then
+  DISPLAY_STR="$(hyprctl monitors 2>/dev/null | grep -oE '[0-9]+x[0-9]+@[0-9.]+' | head -1 \
+    | sed -E 's/@([0-9]+)(\.[0-9]+)?/ @ \1 Hz/')"
+fi
+
+# ---------------------------------------------------------------------------
+# Active Omarchy theme colours (colors.toml -> alacritty.toml -> dark default)
+# ---------------------------------------------------------------------------
+THEME_DIR="$HOME/.config/omarchy/current/theme"
+THEME_NAME="$(cat "$HOME/.config/omarchy/current/theme.name" 2>/dev/null || echo '')"
+THEME_NAME="$(trim "$THEME_NAME")"; [ -n "$THEME_NAME" ] || THEME_NAME="default"
+
+toml_color() { awk -F'=' -v k="$1" '{gsub(/[ \t]/,"",$1)} $1==k{gsub(/[ "\t]/,"",$2); print $2; exit}' "$2" 2>/dev/null; }
+T_ACCENT=""; T_BG=""; T_FG=""; T_SEL=""; T_DIM=""; T_C0=""
+if [ -f "$THEME_DIR/colors.toml" ]; then
+  T_ACCENT="$(toml_color accent      "$THEME_DIR/colors.toml")"
+  T_BG="$(toml_color background       "$THEME_DIR/colors.toml")"
+  T_FG="$(toml_color foreground       "$THEME_DIR/colors.toml")"
+  T_SEL="$(toml_color selection_background "$THEME_DIR/colors.toml")"
+  T_DIM="$(toml_color color8          "$THEME_DIR/colors.toml")"
+  T_C0="$(toml_color color0           "$THEME_DIR/colors.toml")"
+fi
+# universal fallback: every Omarchy theme ships alacritty.toml
+if [ -z "$T_BG" ] && [ -f "$THEME_DIR/alacritty.toml" ]; then
+  T_BG="$(awk -F'=' '/^background/{gsub(/[ "\t]/,"",$2);print $2;exit}' "$THEME_DIR/alacritty.toml")"
+  T_FG="$(awk -F'=' '/^foreground/{gsub(/[ "\t]/,"",$2);print $2;exit}' "$THEME_DIR/alacritty.toml")"
+fi
+# hard defaults (tokyo-night-ish) so the app always renders
+[ -n "$T_BG" ]     || T_BG="#16181d"
+[ -n "$T_FG" ]     || T_FG="#e6e6e6"
+[ -n "$T_ACCENT" ] || T_ACCENT="${T_SEL:-#7aa2f7}"
+[ -n "$T_DIM" ]    || T_DIM="#6b7089"
+[ -n "$T_SEL" ]    || T_SEL="$T_ACCENT"
+[ -n "$T_C0" ]     || T_C0="$T_BG"
+
+# ---------------------------------------------------------------------------
+# Emit JSON + launch the QML card
+# ---------------------------------------------------------------------------
+DATA="$(mktemp --tmpdir "${APP_NAME}.XXXXXX.json")"
+cleanup() { rm -f "$DATA"; }
+trap cleanup EXIT
+
+cat > "$DATA" <<JSON
+{
+  "lang":    "$UI_LANG",
+  "os":      { "name": "$(jesc "$OS_NAME")", "brand": "$(jesc "$BRAND")", "wm": "$(jesc "$WM")",
+               "kernel": "$(jesc "$KERNEL")", "arch": "$(jesc "$ARCH")", "uptime_sec": ${UPTIME_SEC:-0} },
+  "host":    { "hostname": "$(jesc "$HOSTNAME")", "model": "$(jesc "$MODEL")" },
+  "cpu":     { "model": "$(jesc "$CPU_MODEL")", "cores": "$(jesc "$CORES")", "threads": "$(jesc "$THREADS")",
+               "freq": "$(jesc "$CPU_FREQ")" },
+  "gpus":    $GPU_JSON,
+  "memory":  { "total": "$(jesc "$MEM_TOTAL")", "used": "$(jesc "$MEM_USED")" },
+  "disk":    { "free": "$(jesc "$DISK_FREE")", "total": "$(jesc "$DISK_TOTAL")" },
+  "display": "$(jesc "$DISPLAY_STR")",
+  "theme":   { "name": "$(jesc "$THEME_NAME")", "accent": "$T_ACCENT", "background": "$T_BG",
+               "foreground": "$T_FG", "dim": "$T_DIM", "selection": "$T_SEL", "surface": "$T_C0" }
+}
+JSON
+
+# Everything after `--` is handed to the app as Qt.application.arguments rather
+# than being treated by the qml runtime as extra QML files to load. We pass any
+# user flags (e.g. --shot=PATH) plus the data file, and read it from QML via an
+# XHR gated by QML_XHR_ALLOW_FILE_READ. We do not exec, so the EXIT trap can
+# remove the temp file once the window is closed.
+env QML_XHR_ALLOW_FILE_READ=1 "$QML_BIN" "$SHARE_DIR/main.qml" -- "$@" "$DATA"

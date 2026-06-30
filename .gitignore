@@ -1,0 +1,10 @@
+# build / packaging artifacts
+*.tar.gz
+*.pkg.tar.zst
+pkg/
+src/
+
+# editor / OS cruft
+*.swp
+*~
+.DS_Store

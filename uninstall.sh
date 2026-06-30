@@ -4,6 +4,7 @@ set -euo pipefail
 PREFIX="${PREFIX:-$HOME/.local}"
 
 rm -f "$PREFIX/bin/omarchy-about"
+rm -rf "$PREFIX/lib/omarchy-about"
 rm -rf "$PREFIX/share/omarchy-about"
 rm -f "$PREFIX/share/icons/hicolor/scalable/apps/omarchy-about.svg"
 rm -f "$PREFIX/share/applications/omarchy-about.desktop"

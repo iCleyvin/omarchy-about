@@ -17,13 +17,15 @@ APP_NAME="omarchy-about"
 # Locate the QML assets. Works whether we were installed system-wide (/usr),
 # per-user (~/.local) or are being run straight from a git checkout.
 # ---------------------------------------------------------------------------
+# Resolve our own directory (following symlinks) to find sibling assets.
+_src="${BASH_SOURCE[0]}"
+while [ -h "$_src" ]; do _src="$(readlink "$_src")"; done
+SELF_DIR="$(cd "$(dirname "$_src")" && pwd)"
+
 find_share() {
-  local src dir self
-  src="${BASH_SOURCE[0]}"
-  while [ -h "$src" ]; do src="$(readlink "$src")"; done
-  self="$(cd "$(dirname "$src")" && pwd)"
+  local dir
   for dir in \
-    "$self/../share/$APP_NAME" \
+    "$SELF_DIR/../share/$APP_NAME" \
     "/usr/share/$APP_NAME" \
     "/usr/local/share/$APP_NAME" \
     "$HOME/.local/share/$APP_NAME"; do
@@ -37,9 +39,29 @@ SHARE_DIR="$(find_share)" || {
   exit 1
 }
 
-# Pick a QML runtime (qml6 on most distros, qml as fallback).
-QML_BIN="$(command -v qml6 || command -v qml || true)"
-[ -n "$QML_BIN" ] || { echo "$APP_NAME: qml runtime not found (install qt6-declarative)" >&2; exit 1; }
+# Prefer the tiny compiled launcher: it gives the window a stable Wayland
+# app_id (com.omarchy.about) so the keybinding can focus an existing window and
+# Hyprland rules can target it by class. Without it we fall back to the generic
+# qml runtime (the card is identical; only the window class differs).
+find_bin() {
+  local c
+  for c in \
+    "$SELF_DIR/../lib/$APP_NAME/$APP_NAME-bin" \
+    "$SELF_DIR/../build/$APP_NAME-bin" \
+    "/usr/lib/$APP_NAME/$APP_NAME-bin" \
+    "/usr/local/lib/$APP_NAME/$APP_NAME-bin" \
+    "$HOME/.local/lib/$APP_NAME/$APP_NAME-bin"; do
+    [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+NATIVE_BIN="$(find_bin || true)"
+
+if [ -z "$NATIVE_BIN" ]; then
+  # Pick a QML runtime (qml6 on most distros, qml as fallback).
+  QML_BIN="$(command -v qml6 || command -v qml || true)"
+  [ -n "$QML_BIN" ] || { echo "$APP_NAME: need the compiled launcher or a qml runtime (install qt6-declarative)" >&2; exit 1; }
+fi
 
 # ---------------------------------------------------------------------------
 # Small helpers. Everything is parsed under LC_ALL=C so labels stay English
@@ -205,9 +227,14 @@ cat > "$DATA" <<JSON
 }
 JSON
 
-# Everything after `--` is handed to the app as Qt.application.arguments rather
-# than being treated by the qml runtime as extra QML files to load. We pass any
-# user flags (e.g. --shot=PATH) plus the data file, and read it from QML via an
-# XHR gated by QML_XHR_ALLOW_FILE_READ. We do not exec, so the EXIT trap can
-# remove the temp file once the window is closed.
-env QML_XHR_ALLOW_FILE_READ=1 "$QML_BIN" "$SHARE_DIR/main.qml" -- "$@" "$DATA"
+# We pass user flags (e.g. --shot=PATH) plus the data file; QML reads the JSON
+# via an XHR gated by QML_XHR_ALLOW_FILE_READ and picks the args out of
+# Qt.application.arguments. We do not exec, so the EXIT trap removes the temp
+# file once the window closes.
+if [ -n "$NATIVE_BIN" ]; then
+  env QML_XHR_ALLOW_FILE_READ=1 OMARCHY_ABOUT_QML="$SHARE_DIR/main.qml" "$NATIVE_BIN" "$@" "$DATA"
+else
+  # Everything after `--` is handed to the app rather than being treated by the
+  # qml runtime as extra QML files to load.
+  env QML_XHR_ALLOW_FILE_READ=1 "$QML_BIN" "$SHARE_DIR/main.qml" -- "$@" "$DATA"
+fi

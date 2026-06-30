@@ -12,4 +12,4 @@ Terminal=false
 Categories=System;Utility;
 Keywords=system;hardware;info;about;specs;cpu;gpu;ram;omarchy;
 Keywords[es]=sistema;hardware;info;acerca;especificaciones;cpu;gpu;ram;omarchy;
-StartupWMClass=omarchy-about
+StartupWMClass=com.omarchy.about
